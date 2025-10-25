@@ -1,0 +1,13 @@
+PyMuPDF
+langchain
+langchain-core
+langchain-community
+transformers
+torch
+pillow
+scikit-learn
+numpy
+faiss-cpu
+python-dotenv
+tiktoken
+openai
