@@ -2,6 +2,8 @@ PyMuPDF
 langchain
 langchain-core
 langchain-community
+langchain-groq
+groq
 transformers
 torch
 pillow
@@ -10,4 +12,4 @@ numpy
 faiss-cpu
 python-dotenv
 tiktoken
-openai
+python-docx

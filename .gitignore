@@ -14,6 +14,7 @@ env/
 
 # Ignore Jupyter notebook checkpoints
 .ipynb_checkpoints/
+*_output.ipynb
 
 # Ignore logs and database files
 *.log
@@ -38,3 +39,16 @@ checkpoints/
 *.pkl
 *.npy
 *.npz
+
+# Ignore HuggingFace model cache
+.cache/
+huggingface/
+
+# Ignore FAISS index files
+*.faiss
+*.index
+
+# Ignore uploaded/test documents
+*.pdf
+*.docx
+*.txt
