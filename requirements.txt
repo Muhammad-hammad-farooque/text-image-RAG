@@ -13,3 +13,4 @@ faiss-cpu
 python-dotenv
 tiktoken
 python-docx
+chainlit
