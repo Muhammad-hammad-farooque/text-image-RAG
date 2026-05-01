@@ -1,75 +1,136 @@
+import asyncio
+from pathlib import Path
+
 import chainlit as cl
-from backend import llm, load_document, retrieve, build_message
+
+from core.config import settings
+from core.logger import logger
+from rag.embedder import embed_texts
+from rag.generator import generate_stream
+from rag.parser import parse
+from rag.reranker import rerank
+from rag.retriever import retrieve
+from rag.vector_store import upsert
+
+ACCEPT_MIME_TYPES = [
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "text/plain",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "text/csv",
+]
+
+
+def _ingest_file(file_path: str, collection: str) -> list:
+    chunks = parse(file_path)
+    texts = [c["text"] for c in chunks]
+    embeddings = embed_texts(texts)
+    upsert(chunks, embeddings, collection)
+    return chunks
 
 
 @cl.on_chat_start
 async def start():
     await cl.Message(
-        content="Welcome to **Text-Image RAG**!\n\nUpload a document (`.pdf`, `.docx`, or `.txt`) to get started."
+        content=(
+            "Welcome to **Text-Image RAG**!\n\n"
+            "Upload a document (`.pdf`, `.docx`, `.txt`, `.xlsx`, `.csv`) to get started."
+        )
     ).send()
 
     files = await cl.AskFileMessage(
         content="Upload your document:",
-        accept=[
-            "application/pdf",
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            "text/plain"
-        ],
-        max_size_mb=50,
+        accept=ACCEPT_MIME_TYPES,
+        max_size_mb=settings.max_file_size_mb,
     ).send()
 
-    file = files[0]
+    if not files:
+        await cl.Message(content="No file received. Please refresh and try again.").send()
+        return
 
-    processing_msg = cl.Message(content=f"Processing **{file.name}** — this may take a moment...")
-    await processing_msg.send()
+    file = files[0]
+    collection = cl.context.session.id or "default"
+
+    status_msg = cl.Message(content=f"Processing **{file.name}**...")
+    await status_msg.send()
 
     try:
-        vector_store, image_data_stores, n_chunks, n_images = load_document(file.path)
+        chunks = await asyncio.to_thread(_ingest_file, file.path, collection)
+        cl.user_session.set("collection", collection)
 
-        cl.user_session.set("vector_store", vector_store)
-        cl.user_session.set("image_data_stores", image_data_stores)
+        n_text = sum(1 for c in chunks if c["type"] == "text")
+        n_table = sum(1 for c in chunks if c["type"] == "table")
+        n_image = sum(1 for c in chunks if c["type"] == "image")
 
         await cl.Message(
             content=(
                 f"**{file.name}** is ready!\n\n"
-                f"- Text chunks: **{n_chunks}**\n"
-                f"- Images: **{n_images}**\n\n"
-                f"Ask me anything about your document."
+                f"- Text chunks: **{n_text}**\n"
+                f"- Tables: **{n_table}**\n"
+                f"- Images: **{n_image}**\n\n"
+                "Ask me anything about your document."
             )
         ).send()
 
     except Exception as e:
+        logger.error(f"Ingestion failed: {e}")
         await cl.Message(content=f"Error processing document: `{str(e)}`").send()
+
+
+async def _astream_generate(question: str, chunks: list):
+    """Wrap the sync generate_stream generator as an async generator."""
+    loop = asyncio.get_running_loop()
+    gen = generate_stream(question, chunks)
+    while True:
+        try:
+            item = await loop.run_in_executor(None, next, gen)
+            yield item
+        except StopIteration:
+            break
 
 
 @cl.on_message
 async def main(message: cl.Message):
-    vector_store = cl.user_session.get("vector_store")
-    image_data_stores = cl.user_session.get("image_data_stores")
-
-    if not vector_store:
+    collection = cl.user_session.get("collection")
+    if not collection:
         await cl.Message(content="Please upload a document first.").send()
         return
 
-    retrieved_docs = retrieve(message.content, vector_store, k=5)
-    human_message = build_message(message.content, retrieved_docs, image_data_stores)
+    try:
+        candidates = await asyncio.to_thread(
+            retrieve,
+            message.content,
+            collection,
+            settings.retrieval_top_k,
+            True,  # use_hyde
+        )
 
-    # Stream response token by token
-    response_msg = cl.Message(content="")
-    await response_msg.send()
+        if not candidates:
+            await cl.Message(content="No relevant context found in the document.").send()
+            return
 
-    async for chunk in llm.astream([human_message]):
-        await response_msg.stream_token(chunk.content)
+        ranked_chunks = await asyncio.to_thread(
+            rerank, message.content, candidates, settings.rerank_top_n
+        )
 
-    # Append sources
-    sources = []
-    for doc in retrieved_docs:
-        page = doc.metadata.get("page", "?")
-        if doc.metadata.get("type") == "text":
-            preview = doc.page_content[:80] + "..." if len(doc.page_content) > 80 else doc.page_content
-            sources.append(f"- Text (page {page}): *{preview}*")
-        else:
-            sources.append(f"- Image (page {page})")
+        response_msg = cl.Message(content="")
+        await response_msg.send()
 
-    response_msg.content += "\n\n---\n**Sources retrieved:**\n" + "\n".join(sources)
-    await response_msg.update()
+        sources: list[dict] = []
+        async for item in _astream_generate(message.content, ranked_chunks):
+            if isinstance(item, str):
+                await response_msg.stream_token(item)
+            elif isinstance(item, dict) and "sources" in item:
+                sources = item["sources"]
+
+        if sources:
+            source_lines = [
+                f"- [{s['type'].capitalize()}] **{s['source']}** (page {s['page']})"
+                for s in sources
+            ]
+            response_msg.content += "\n\n---\n**Sources:**\n" + "\n".join(source_lines)
+            await response_msg.update()
+
+    except Exception as e:
+        logger.error(f"Query failed: {e}")
+        await cl.Message(content=f"Error: `{str(e)}`").send()
