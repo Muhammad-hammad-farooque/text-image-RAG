@@ -1,4 +1,5 @@
 import asyncio
+import base64
 from pathlib import Path
 
 import chainlit as cl
@@ -62,6 +63,15 @@ async def start():
         n_table = sum(1 for c in chunks if c["type"] == "table")
         n_image = sum(1 for c in chunks if c["type"] == "image")
 
+        # Build page → [b64, ...] map and store in session for image display
+        page_images: dict[int, list[str]] = {}
+        for c in chunks:
+            if c["type"] == "image":
+                b64 = c["metadata"].get("image_base64", "")
+                if b64:
+                    page_images.setdefault(c["page"], []).append(b64)
+        cl.user_session.set("page_images", page_images)
+
         await cl.Message(
             content=(
                 f"**{file.name}** is ready!\n\n"
@@ -77,16 +87,24 @@ async def start():
         await cl.Message(content=f"Error processing document: `{str(e)}`").send()
 
 
+_DONE = object()
+
+
+def _next_item(gen):
+    try:
+        return next(gen)
+    except StopIteration:
+        return _DONE
+
+
 async def _astream_generate(question: str, chunks: list):
-    """Wrap the sync generate_stream generator as an async generator."""
     loop = asyncio.get_running_loop()
     gen = generate_stream(question, chunks)
     while True:
-        try:
-            item = await loop.run_in_executor(None, next, gen)
-            yield item
-        except StopIteration:
+        item = await loop.run_in_executor(None, _next_item, gen)
+        if item is _DONE:
             break
+        yield item
 
 
 @cl.on_message
@@ -112,6 +130,33 @@ async def main(message: cl.Message):
         ranked_chunks = await asyncio.to_thread(
             rerank, message.content, candidates, settings.rerank_top_n
         )
+
+        # Collect pages from retrieved chunks and show matching images
+        page_images: dict[int, list[str]] = cl.user_session.get("page_images") or {}
+        if page_images:
+            retrieved_pages = {
+                chunk.get("payload", {}).get("page", -1)
+                for chunk in ranked_chunks
+            }
+            image_elements = []
+            seen: set[str] = set()
+            for page in sorted(retrieved_pages):
+                for b64 in page_images.get(page, []):
+                    if b64 not in seen:
+                        seen.add(b64)
+                        image_elements.append(
+                            cl.Image(
+                                name=f"page{page}_{len(image_elements)}",
+                                display="inline",
+                                content=base64.b64decode(b64),
+                            )
+                        )
+
+            if image_elements:
+                await cl.Message(
+                    content="**Relevant images from document:**",
+                    elements=image_elements,
+                ).send()
 
         response_msg = cl.Message(content="")
         await response_msg.send()

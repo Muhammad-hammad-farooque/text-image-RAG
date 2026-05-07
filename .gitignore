@@ -52,3 +52,19 @@ huggingface/
 *.pdf
 *.docx
 *.txt
+
+# Ignore logs directory
+logs/
+
+# Ignore Claude Code settings
+.claude/
+.mcp.json
+
+# Ignore temp/uploaded files
+uploads/
+tmp/
+temp/
+
+# Ignore OS files
+Thumbs.db
+desktop.ini
